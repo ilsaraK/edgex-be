@@ -58,52 +58,74 @@ class RGBTEdgeDetector:
         }
 
 
+    # Maximum length of the longer edge processed internally.
+    # Larger images are scaled down to this cap before Sobel computation,
+    # then the result is scaled back up — keeping memory bounded while
+    # preserving far more detail than the old fixed 256 × 256 grid.
+    MAX_PROCESS_EDGE = 2048
+
     def preprocess(
         self,
         rgb:     Optional[np.ndarray],
         thermal: Optional[np.ndarray],
     ) -> tuple[Optional[np.ndarray], Optional[np.ndarray], tuple[int, int]]:
         """
-        Resize inputs to model input size and normalise to zero mean / unit std.
+        Normalise inputs to zero mean / unit std at their native resolution
+        (capped at MAX_PROCESS_EDGE on the longer side).
 
-        Returns (rgb_f32, thm_f32, original_hw) so postprocess can upsample
-        the output back to the original resolution.
+        Returns (rgb_f32, thm_f32, original_hw) so postprocess can restore
+        the output to the exact original resolution.
         """
         h_in = (rgb.shape[0] if rgb is not None else thermal.shape[0])
         w_in = (rgb.shape[1] if rgb is not None else thermal.shape[1])
         original_hw = (h_in, w_in)
 
-        H, W = self.INPUT_SHAPE[:2]
+        # Scale down only if necessary, preserving aspect ratio
+        scale = min(1.0, self.MAX_PROCESS_EDGE / max(h_in, w_in))
+        H = round(h_in * scale)
+        W = round(w_in * scale)
+
         rgb_out = None
         thm_out = None
 
         if rgb is not None:
-            resized = cv2.resize(rgb.astype(np.float32) / 255.0, (W, H),
-                                 interpolation=cv2.INTER_LANCZOS4)
-            rgb_out = (resized - self._rgb_mean) / self._rgb_std
+            src = rgb.astype(np.float32) / 255.0
+            if scale < 1.0:
+                src = cv2.resize(src, (W, H), interpolation=cv2.INTER_LANCZOS4)
+            rgb_out = (src - self._rgb_mean) / self._rgb_std
 
         if thermal is not None:
             t = thermal.astype(np.float32) / 255.0
             if len(t.shape) == 3:
-                # Collapse any colour-channel thermal image to grayscale
                 t = 0.299 * t[..., 0] + 0.587 * t[..., 1] + 0.114 * t[..., 2]
-            resized = cv2.resize(t, (W, H), interpolation=cv2.INTER_LANCZOS4)
-            thm_out = (resized - self._thm_mean) / self._thm_std
+            if scale < 1.0:
+                t = cv2.resize(t, (W, H), interpolation=cv2.INTER_LANCZOS4)
+            thm_out = (t - self._thm_mean) / self._thm_std
 
         return rgb_out, thm_out, original_hw
 
     @staticmethod
     def _luminance(arr_f32: np.ndarray) -> np.ndarray:
-        """Normalised float image → luminance in [0, 1]."""
+        """
+        Normalised float image → luminance in [0, 1] with CLAHE applied.
+
+        CLAHE (Contrast Limited Adaptive Histogram Equalization) equalises
+        contrast locally so that dark regions of the image (e.g. shadowed
+        cars, trees at night) contribute edges on the same footing as
+        brightly-lit regions, instead of being suppressed by global scaling.
+        """
         if len(arr_f32.shape) == 3:
             lum = (0.299 * arr_f32[..., 0] +
                    0.587 * arr_f32[..., 1] +
                    0.114 * arr_f32[..., 2])
         else:
             lum = arr_f32.copy()
-        # Re-scale from standardised range back to [0, 1] for gradient ops
+        # Re-scale from standardised range back to [0, 255] for CLAHE
         lum = (lum - lum.min()) / (lum.max() - lum.min() + 1e-8)
-        return lum.astype(np.float32)
+        lum_u8 = (lum * 255).astype(np.uint8)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        lum_eq = clahe.apply(lum_u8).astype(np.float32) / 255.0
+        return lum_eq
 
     @staticmethod
     def _multi_scale_gradients(
@@ -161,12 +183,52 @@ class RGBTEdgeDetector:
         mx = out.max()
         return (out / mx) if mx > 1e-8 else out
 
+    @staticmethod
+    def _hysteresis(
+        nms:  np.ndarray,
+        low:  float = 0.08,
+        high: float = 0.25,
+    ) -> np.ndarray:
+        """
+        Canny-style hysteresis thresholding on an NMS-thinned gradient map.
+
+        Pixels above `high` are definite edges.
+        Pixels between `low` and `high` are kept only when 8-connected
+        to a definite edge pixel.  Everything else is suppressed.
+        The result is a binary float32 map (0.0 or 1.0) — pure black/white
+        edges with no grey fuzz.
+        """
+        strong    = nms >= high
+        candidate = nms >= low          # weak ∪ strong
+
+        n_labels, labels = cv2.connectedComponents(
+            candidate.astype(np.uint8), connectivity=8
+        )
+
+        # Which component labels contain at least one strong pixel?
+        strong_labels = set(int(l) for l in np.unique(labels[strong]) if l != 0)
+
+        edge_mask = np.zeros_like(nms, dtype=np.float32)
+        for label in strong_labels:
+            edge_mask[labels == label] = 1.0
+
+        return edge_mask
+
     # ── predict ────────────────────────────────────────────────────────────────
+
+    # Hysteresis thresholds per modality.
+    # Thermal gradients are weaker (temperature transitions are gradual),
+    # so lower thresholds are needed to capture the same density of edges.
+    _HYSTERESIS = {
+        "rgb":          (0.08, 0.25),
+        "thermal":      (0.04, 0.12),
+        "rgb+thermal":  (0.06, 0.18),  # fused: weighted blend of both ranges
+    }
 
     def predict(
         self,
-        rgb:     Optional[np.ndarray] = None,
-        thermal: Optional[np.ndarray] = None,
+        rgb:      Optional[np.ndarray] = None,
+        thermal:  Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """
         Run edge detection on preprocessed inputs.
@@ -178,7 +240,7 @@ class RGBTEdgeDetector:
 
         Returns
         -------
-        float32 (H, W) edge probability map in [0, 1]
+        float32 (H, W) binary edge map — 0.0 (background) or 1.0 (edge)
         """
         if rgb is None and thermal is None:
             raise ValueError("At least one of rgb or thermal must be provided.")
@@ -203,24 +265,17 @@ class RGBTEdgeDetector:
             mag = self.RGB_WEIGHT * streams_mag[0] + self.THM_WEIGHT * streams_mag[1]
             gx  = self.RGB_WEIGHT * streams_gx[0]  + self.THM_WEIGHT * streams_gx[1]
             gy  = self.RGB_WEIGHT * streams_gy[0]  + self.THM_WEIGHT * streams_gy[1]
+            modality = "rgb+thermal"
+        elif rgb is not None:
+            mag, gx, gy = streams_mag[0], streams_gx[0], streams_gy[0]
+            modality = "rgb"
         else:
             mag, gx, gy = streams_mag[0], streams_gx[0], streams_gy[0]
+            modality = "thermal"
 
         thin = self._nms(mag, gx, gy)
-
-        # Boundary probability smoothing (sub-pixel spread)
-        prob = cv2.GaussianBlur(thin, (0, 0), sigmaX=0.5, sigmaY=0.5)
-        mx   = prob.max()
-        if mx > 1e-8:
-            prob /= mx
-
-        # Suppress low-confidence background responses
-        prob = np.where(prob > 0.22, prob, 0.0)
-        mx   = prob.max()
-        if mx > 1e-8:
-            prob /= mx
-
-        return np.clip(prob, 0.0, 1.0).astype(np.float32)
+        low, high = self._HYSTERESIS[modality]
+        return self._hysteresis(thin, low=low, high=high)
 
     # ── postprocessing ─────────────────────────────────────────────────────────
 
@@ -230,12 +285,12 @@ class RGBTEdgeDetector:
         original_hw: tuple[int, int],
     ) -> np.ndarray:
         """
-        Upsample probability map back to the original input resolution
+        Restore the probability map to the exact original input resolution
         and convert to a uint8 edge image (white edges on black background).
         """
         h, w = original_hw
         if prob_map.shape != (h, w):
-            prob_map = cv2.resize(prob_map, (w, h), interpolation=cv2.INTER_LINEAR)
+            prob_map = cv2.resize(prob_map, (w, h), interpolation=cv2.INTER_CUBIC)
         return (np.clip(prob_map, 0, 1) * 255).astype(np.uint8)
 
 
