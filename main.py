@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+import time
 from fastapi import FastAPI, File, Request, UploadFile, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -380,6 +381,57 @@ def _encode_png(arr: np.ndarray) -> str:
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
 
 
+def _reference_gray_uint8(source: np.ndarray) -> np.ndarray:
+    if source.ndim == 2:
+        return source.astype(np.uint8)
+    return cv2.cvtColor(source, cv2.COLOR_RGB2GRAY)
+
+
+def _gradient_support_ratio(source_gray_u8: np.ndarray, edge_gray_u8: np.ndarray) -> float:
+    if source_gray_u8.shape[:2] != edge_gray_u8.shape[:2]:
+        return 0.0
+    src = source_gray_u8.astype(np.float32)
+    gx = cv2.Sobel(src, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(src, cv2.CV_32F, 0, 1, ksize=3)
+    mag = np.sqrt(gx * gx + gy * gy)
+    mask = edge_gray_u8 > 127
+    if not np.any(mask):
+        return 0.0
+    edge_mean = float(np.mean(mag[mask]))
+    global_mean = float(np.mean(mag) + 1e-6)
+    return edge_mean / global_mean
+
+
+def _structure_alignment_index(support_ratio: float, coverage: float) -> float:
+    if coverage <= 1e-6 or support_ratio <= 0.0:
+        return 0.0
+    idx = min(100.0, max(0.0, (support_ratio - 1.0) * 66.67))
+    if coverage > 0.35:
+        idx *= max(0.15, 1.0 - (coverage - 0.35) * 1.5)
+    return round(float(idx), 1)
+
+
+def _output_edge_metrics(
+    edge_map: np.ndarray,
+    source_for_alignment: Optional[np.ndarray] = None,
+) -> dict[str, float]:
+    gray = edge_map if edge_map.ndim == 2 else cv2.cvtColor(edge_map, cv2.COLOR_RGB2GRAY)
+    gray_u8 = gray.astype(np.uint8)
+    coverage = float(np.mean(gray_u8 > 127))
+    sharp = float(cv2.Laplacian(gray_u8, cv2.CV_64F).var())
+    out: dict[str, float] = {
+        "edge_coverage_ratio": round(coverage, 6),
+        "contour_sharpness": round(sharp, 2),
+    }
+    if source_for_alignment is not None:
+        ref = _reference_gray_uint8(source_for_alignment)
+        if ref.shape[:2] == gray_u8.shape[:2]:
+            support = _gradient_support_ratio(ref, gray_u8)
+            out["gradient_support_ratio"] = round(float(support), 4)
+            out["structure_alignment_index"] = _structure_alignment_index(support, coverage)
+    return out
+
+
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @app.get("/")
@@ -428,6 +480,7 @@ async def detect_edges(
                                       "issues": issues})
 
         # ── model inference pipeline ──────────────────────────────────────────
+        t0 = time.perf_counter()
         if image_type == "thermal":
             _, thm_pre, original_hw = model.preprocess(None, img_array)
             prob_map = model.predict(thermal=thm_pre)
@@ -435,6 +488,8 @@ async def detect_edges(
             rgb_pre, _, original_hw = model.preprocess(img_array, None)
             prob_map = model.predict(rgb=rgb_pre)
         edge_map = model.postprocess(prob_map, original_hw)
+        generation_time_seconds = time.perf_counter() - t0
+        output_metrics = _output_edge_metrics(edge_map, img_array)
         # ─────────────────────────────────────────────────────────────────────
 
         original_fmt = "image/png" if file.filename.lower().endswith(".png") else "image/jpeg"
@@ -444,6 +499,8 @@ async def detect_edges(
             "edge_detected_image": _encode_png(cv2.cvtColor(edge_map, cv2.COLOR_GRAY2RGB)),
             "image_type":          image_type,
             "filename":            file.filename,
+            "generation_time_seconds": round(generation_time_seconds, 6),
+            "output_metrics":      output_metrics,
         })
 
     except HTTPException:
@@ -494,17 +551,20 @@ async def detect_edges_rgbt(
                 raise HTTPException(422, {"error": "Thermal image not suitable.", "issues": issues})
             response["thermal_image"] = _encode_png(thm_array)
 
-        # Align spatial dimensions if both streams are present
+        # ── model inference pipeline (timing includes fusion alignment when both modalities) ──
+        t0 = time.perf_counter()
         if rgb_array is not None and thm_array is not None:
             h, w = rgb_array.shape[:2]
             if thm_array.shape[:2] != (h, w):
                 thm_array = np.array(
                     Image.fromarray(thm_array).resize((w, h), Image.LANCZOS))
 
-        # ── model inference pipeline ──────────────────────────────────────────
         rgb_pre, thm_pre, original_hw = model.preprocess(rgb_array, thm_array)
         prob_map                       = model.predict(rgb=rgb_pre, thermal=thm_pre)
         edge_map                       = model.postprocess(prob_map, original_hw)
+        generation_time_seconds = time.perf_counter() - t0
+        reference_for_metrics = rgb_array if rgb_array is not None else thm_array
+        output_metrics = _output_edge_metrics(edge_map, reference_for_metrics)
         # ─────────────────────────────────────────────────────────────────────
 
         mode_str = (
@@ -518,6 +578,8 @@ async def detect_edges_rgbt(
         response["method"]         = "CMAF"
         response["original_image"] = response.get("rgb_image") or response.get("thermal_image")
         response["filename"]       = (rgb or thermal).filename
+        response["generation_time_seconds"] = round(generation_time_seconds, 6)
+        response["output_metrics"] = output_metrics
         return JSONResponse(content=response)
 
     except HTTPException:
